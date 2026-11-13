@@ -1,0 +1,23 @@
+[package]
+name = "payments_sdk"
+version = "0.1.0"
+edition = "2024"
+description = "Client of the Payments router: signed requests, notice verification and the contract's types."
+license = "MIT"
+repository = "https://github.com/JhonaCodes/payments_sdk"
+readme = "README.md"
+
+[dependencies]
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+hex = "0.4"
+hmac = "0.12"
+reqwest = { version = "0.11", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+uuid = { version = "1", features = ["serde", "v4"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util"] }
