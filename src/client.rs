@@ -14,7 +14,10 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::error::PaymentsError;
-use crate::model::{CreateIntent, CreateSubscription, Intent, Plan, Subscription};
+use crate::model::{
+    AddedItem, CreateIntent, CreateSubscription, Intent, Plan, PortalSession, Proration,
+    ProviderPrice, ProviderSubscription, Subscription, UsageEvent, UsageReport,
+};
 use crate::notice::{MERCHANT_HEADER, NONCE_HEADER, SIGNATURE_HEADER, TIMESTAMP_HEADER};
 use crate::signature::{build_message, sign};
 
@@ -212,5 +215,209 @@ impl PaymentsGateway for PaymentsClient {
 
     async fn list_plans(&self) -> Result<Vec<Plan>, PaymentsError> {
         self.call::<(), _>(Method::GET, "/v1/plans", None).await
+    }
+}
+
+/// What a merchant asks the router about the subscriptions a provider
+/// manages itself (Stripe, with `provider_plan`): the router keeps their
+/// mirror and passes each operation on to the provider, so the merchant
+/// never holds the provider's keys. Its own trait, so a fake of
+/// [`PaymentsGateway`] keeps compiling.
+#[async_trait]
+pub trait ProviderSubscriptions: Send + Sync {
+    /// The mirror as the router has it now.
+    async fn provider_subscription(&self, id: Uuid) -> Result<ProviderSubscription, PaymentsError>;
+    /// The mirrors of one customer, live ones first.
+    async fn provider_subscriptions_of(
+        &self,
+        external_user_ref: &str,
+    ) -> Result<Vec<ProviderSubscription>, PaymentsError>;
+    /// Ends it now, or at `current_period_end` when `at_period_end`.
+    async fn cancel_provider_subscription(
+        &self,
+        id: Uuid,
+        at_period_end: bool,
+    ) -> Result<ProviderSubscription, PaymentsError>;
+    /// Undoes a scheduled end.
+    async fn resume_provider_subscription(
+        &self,
+        id: Uuid,
+    ) -> Result<ProviderSubscription, PaymentsError>;
+    /// Moves the base item (never the metered one) to `price_ref`.
+    async fn change_provider_price(
+        &self,
+        id: Uuid,
+        price_ref: &str,
+        proration: Proration,
+    ) -> Result<ProviderSubscription, PaymentsError>;
+    /// A provider page where the customer manages it; back to `return_url`.
+    async fn provider_portal(
+        &self,
+        id: Uuid,
+        return_url: &str,
+    ) -> Result<PortalSession, PaymentsError>;
+    /// Adds an item of `price_ref` (a metered price); the one already there
+    /// when it has it.
+    async fn add_item(&self, id: Uuid, price_ref: &str) -> Result<AddedItem, PaymentsError>;
+    /// Reports metered usage (1 to 100 events).
+    async fn report_usage(
+        &self,
+        id: Uuid,
+        events: &[UsageEvent],
+    ) -> Result<UsageReport, PaymentsError>;
+    /// The merchant's prices at the provider.
+    async fn provider_prices(&self) -> Result<Vec<ProviderPrice>, PaymentsError>;
+}
+
+/// `value` as one path segment: every byte but the unreserved ones
+/// (`A-Z a-z 0-9 - . _ ~`) percent-encoded, so the router signs and reads
+/// the same path.
+fn path_segment(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                char::from(byte).to_string()
+            }
+            other => format!("%{other:02X}"),
+        })
+        .collect()
+}
+
+/// The path of the mirror `id`, with `action` after it when there is one.
+fn mirror_path(id: Uuid, action: Option<&str>) -> String {
+    match action {
+        Some(action) => format!("/v1/provider-subscriptions/{id}/{action}"),
+        None => format!("/v1/provider-subscriptions/{id}"),
+    }
+}
+
+#[derive(Serialize)]
+struct CancelBody {
+    at_period_end: bool,
+}
+
+#[derive(Serialize)]
+struct ChangePriceBody<'a> {
+    price_ref: &'a str,
+    proration: Proration,
+}
+
+#[derive(Serialize)]
+struct PortalBody<'a> {
+    return_url: &'a str,
+}
+
+#[derive(Serialize)]
+struct ItemBody<'a> {
+    price_ref: &'a str,
+}
+
+#[derive(Serialize)]
+struct UsageBody<'a> {
+    events: &'a [UsageEvent],
+}
+
+#[derive(Serialize)]
+struct EmptyBody {}
+
+#[async_trait]
+impl ProviderSubscriptions for PaymentsClient {
+    async fn provider_subscription(&self, id: Uuid) -> Result<ProviderSubscription, PaymentsError> {
+        self.call::<(), _>(Method::GET, &mirror_path(id, None), None)
+            .await
+    }
+
+    async fn provider_subscriptions_of(
+        &self,
+        external_user_ref: &str,
+    ) -> Result<Vec<ProviderSubscription>, PaymentsError> {
+        let path = format!(
+            "/v1/provider-subscriptions/by-user/{}",
+            path_segment(external_user_ref)
+        );
+        self.call::<(), _>(Method::GET, &path, None).await
+    }
+
+    async fn cancel_provider_subscription(
+        &self,
+        id: Uuid,
+        at_period_end: bool,
+    ) -> Result<ProviderSubscription, PaymentsError> {
+        self.call(
+            Method::POST,
+            &mirror_path(id, Some("cancel")),
+            Some(&CancelBody { at_period_end }),
+        )
+        .await
+    }
+
+    async fn resume_provider_subscription(
+        &self,
+        id: Uuid,
+    ) -> Result<ProviderSubscription, PaymentsError> {
+        self.call(
+            Method::POST,
+            &mirror_path(id, Some("resume")),
+            Some(&EmptyBody {}),
+        )
+        .await
+    }
+
+    async fn change_provider_price(
+        &self,
+        id: Uuid,
+        price_ref: &str,
+        proration: Proration,
+    ) -> Result<ProviderSubscription, PaymentsError> {
+        self.call(
+            Method::POST,
+            &mirror_path(id, Some("change-price")),
+            Some(&ChangePriceBody {
+                price_ref,
+                proration,
+            }),
+        )
+        .await
+    }
+
+    async fn provider_portal(
+        &self,
+        id: Uuid,
+        return_url: &str,
+    ) -> Result<PortalSession, PaymentsError> {
+        self.call(
+            Method::POST,
+            &mirror_path(id, Some("portal")),
+            Some(&PortalBody { return_url }),
+        )
+        .await
+    }
+
+    async fn add_item(&self, id: Uuid, price_ref: &str) -> Result<AddedItem, PaymentsError> {
+        self.call(
+            Method::POST,
+            &mirror_path(id, Some("items")),
+            Some(&ItemBody { price_ref }),
+        )
+        .await
+    }
+
+    async fn report_usage(
+        &self,
+        id: Uuid,
+        events: &[UsageEvent],
+    ) -> Result<UsageReport, PaymentsError> {
+        self.call(
+            Method::POST,
+            &mirror_path(id, Some("usage")),
+            Some(&UsageBody { events }),
+        )
+        .await
+    }
+
+    async fn provider_prices(&self) -> Result<Vec<ProviderPrice>, PaymentsError> {
+        self.call::<(), _>(Method::GET, "/v1/provider-catalog/prices", None)
+            .await
     }
 }

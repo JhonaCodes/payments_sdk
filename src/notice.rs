@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::model::{IntentStatus, Money, Subscription};
+use crate::model::{IntentStatus, Money, ProviderSubscription, Subscription};
 use crate::signature::{build_message, verify, within_window};
 
 pub const MERCHANT_HEADER: &str = "X-Payments-Merchant";
@@ -86,9 +86,11 @@ pub fn verify_notice(
     Ok(())
 }
 
-/// The kinds of notice the router sends.
+/// The kinds of notice the router sends. New kinds come in later versions:
+/// match with a fallback arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum NoticeType {
     /// A one-off charge, or a subscription the provider bills with its own
     /// plan (`provider_plan`): then `provider_transaction_id` is `sub_…`.
@@ -99,6 +101,9 @@ pub enum NoticeType {
     SubscriptionChargeUpcoming,
     /// The customer cancelled a router subscription (ePayco).
     SubscriptionCancelled,
+    /// A subscription the provider manages changed (renewed, failed,
+    /// cancelled, a new price…): read it as [`ProviderSubscriptionNotice`].
+    ProviderSubscription,
 }
 
 impl NoticeType {
@@ -110,6 +115,7 @@ impl NoticeType {
             "subscription_charge" => Some(Self::SubscriptionCharge),
             "subscription_charge_upcoming" => Some(Self::SubscriptionChargeUpcoming),
             "subscription_cancelled" => Some(Self::SubscriptionCancelled),
+            "provider_subscription" => Some(Self::ProviderSubscription),
             _ => None,
         }
     }
@@ -151,6 +157,10 @@ pub struct PaymentNotice {
     /// For a `subscription_charge`, the subscription after that charge.
     #[serde(default)]
     pub subscription: Option<Subscription>,
+    /// For a `provider_plan` charge, the router's mirror of the provider's
+    /// subscription ([`ProviderSubscription::id`]), when it is known.
+    #[serde(default)]
+    pub provider_subscription_id: Option<Uuid>,
 }
 
 /// A `subscription_charge_upcoming` or `subscription_cancelled` notice.
@@ -174,4 +184,53 @@ pub struct SubscriptionEventNotice {
     #[serde(default)]
     pub cancelled_by: Option<String>,
     pub subscription: Subscription,
+}
+
+/// Why a `provider_subscription` notice was sent. A reason this version does
+/// not know reads as [`Self::Unknown`]: apply the snapshot all the same.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderSubscriptionReason {
+    /// Active (or trialing) for the first time.
+    Activated,
+    /// A new period was paid.
+    Renewed,
+    /// A charge failed: the provider retries it.
+    PaymentFailed,
+    /// It will end at `current_period_end`.
+    CancelScheduled,
+    /// A scheduled end was undone.
+    Resumed,
+    /// It is over.
+    Ended,
+    /// Anything else changed (price, state, period).
+    Updated,
+    #[serde(other)]
+    Unknown,
+}
+
+/// The invoice behind a `renewed` or `payment_failed` notice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderInvoice {
+    pub provider_invoice_id: String,
+    pub amount_paid: Money,
+    #[serde(default)]
+    pub period_start: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub period_end: Option<DateTime<Utc>>,
+}
+
+/// A `provider_subscription` notice: the full snapshot of the mirror after
+/// the change. Apply it unless its `version` is at or below the one already
+/// applied (notices may arrive out of order).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderSubscriptionNotice {
+    pub event_id: Uuid,
+    #[serde(rename = "type")]
+    pub notice_type: NoticeType,
+    pub reason: ProviderSubscriptionReason,
+    pub external_user_ref: String,
+    pub subscription: ProviderSubscription,
+    #[serde(default)]
+    pub invoice: Option<ProviderInvoice>,
 }
