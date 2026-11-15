@@ -7,8 +7,12 @@ use std::time::Duration;
 
 use chrono::Utc;
 use payments_sdk::PaymentsError;
-use payments_sdk::client::{PaymentsClient, PaymentsConfig, PaymentsGateway};
-use payments_sdk::model::{CreateIntent, IntentStatus};
+use payments_sdk::client::{
+    PaymentsClient, PaymentsConfig, PaymentsGateway, ProviderSubscriptions,
+};
+use payments_sdk::model::{
+    CreateIntent, IntentStatus, Proration, ProviderSubscriptionStatus, UsageEvent,
+};
 use payments_sdk::signature::{build_message, verify, within_window};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -251,4 +255,245 @@ fn only_transient_failures_are_retryable() {
     assert!(!rejected(422).is_retryable());
     assert!(!rejected(401).is_retryable());
     assert!(!PaymentsError::InvalidResponse("x".into()).is_retryable());
+}
+
+const MIRROR_ID: &str = "9d1e0000-0000-4000-8000-000000000010";
+
+/// A mirror as the router answers it, with `status`.
+fn mirror(status: &str) -> String {
+    format!(
+        r#"{{"id":"{MIRROR_ID}","provider":"stripe","provider_subscription_id":"sub_1","provider_customer_id":"cus_1","external_user_ref":"company-1","external_order_id":"o","external_product_ref":"plan_basic","origin_intent_id":null,"price_ref":"price_basic","metered_item_id":null,"status":"{status}","current_period_start":"2026-11-01T00:00:00Z","current_period_end":"2026-12-01T00:00:00Z","cancel_at_period_end":false,"canceled_at":null,"ended_at":null,"trial_end":null,"version":3,"created_at":"2026-11-01T00:00:00Z","updated_at":"2026-11-15T00:00:00Z"}}"#
+    )
+}
+
+/// `data` wrapping `json`, kept for the one-shot server.
+fn answer(json: String) -> &'static str {
+    Box::leak(format!(r#"{{"data":{json},"status":"success"}}"#).into_boxed_str())
+}
+
+fn mirror_id() -> Uuid {
+    match Uuid::parse_str(MIRROR_ID) {
+        Ok(id) => id,
+        Err(error) => panic!("{error}"),
+    }
+}
+
+async fn seen(server: JoinHandle<Seen>) -> Seen {
+    match server.await {
+        Ok(seen) => seen,
+        Err(error) => panic!("server: {error}"),
+    }
+}
+
+fn body_of(seen: &Seen) -> serde_json::Value {
+    match serde_json::from_slice(&seen.body) {
+        Ok(body) => body,
+        Err(error) => panic!("body: {error}"),
+    }
+}
+
+#[tokio::test]
+async fn a_provider_subscription_is_read_with_a_signed_get() {
+    let (base, server) = serve_once(200, answer(mirror("active"))).await;
+    let read = client(&base).provider_subscription(mirror_id()).await;
+    let seen = seen(server).await;
+    assert_eq!(seen.method, "GET");
+    assert_eq!(seen.path, format!("/v1/provider-subscriptions/{MIRROR_ID}"));
+    assert!(seen.body.is_empty());
+    assert!(seen.is_signed());
+    match read {
+        Ok(read) => {
+            assert_eq!(read.status, ProviderSubscriptionStatus::Active);
+            assert_eq!(read.version, 3);
+        }
+        Err(error) => panic!("{error}"),
+    }
+}
+
+#[tokio::test]
+async fn the_mirrors_of_a_customer_are_asked_with_the_ref_in_the_signed_path() {
+    let (base, server) = serve_once(200, answer(format!("[{}]", mirror("trialing")))).await;
+    let read = client(&base).provider_subscriptions_of("acme co/7").await;
+    let seen = seen(server).await;
+    assert_eq!(seen.method, "GET");
+    assert_eq!(
+        seen.path,
+        "/v1/provider-subscriptions/by-user/acme%20co%2F7"
+    );
+    assert!(seen.is_signed(), "the ref must be inside the signed path");
+    match read {
+        Ok(read) => assert_eq!(read.len(), 1),
+        Err(error) => panic!("{error}"),
+    }
+}
+
+#[tokio::test]
+async fn a_cancel_says_whether_it_waits_for_the_period_end() {
+    let (base, server) = serve_once(200, answer(mirror("active"))).await;
+    let read = client(&base)
+        .cancel_provider_subscription(mirror_id(), true)
+        .await;
+    let seen = seen(server).await;
+    assert_eq!(seen.method, "POST");
+    assert_eq!(
+        seen.path,
+        format!("/v1/provider-subscriptions/{MIRROR_ID}/cancel")
+    );
+    assert!(seen.is_signed());
+    assert_eq!(body_of(&seen), serde_json::json!({"at_period_end": true}));
+    assert!(read.is_ok(), "{read:?}");
+}
+
+#[tokio::test]
+async fn a_resume_posts_an_empty_object() {
+    let (base, server) = serve_once(200, answer(mirror("active"))).await;
+    let read = client(&base)
+        .resume_provider_subscription(mirror_id())
+        .await;
+    let seen = seen(server).await;
+    assert_eq!(seen.method, "POST");
+    assert_eq!(
+        seen.path,
+        format!("/v1/provider-subscriptions/{MIRROR_ID}/resume")
+    );
+    assert!(seen.is_signed());
+    assert_eq!(body_of(&seen), serde_json::json!({}));
+    assert!(read.is_ok(), "{read:?}");
+}
+
+#[tokio::test]
+async fn a_price_change_names_the_price_and_its_proration() {
+    let (base, server) = serve_once(200, answer(mirror("active"))).await;
+    let read = client(&base)
+        .change_provider_price(mirror_id(), "price_standard", Proration::AlwaysInvoice)
+        .await;
+    let seen = seen(server).await;
+    assert_eq!(seen.method, "POST");
+    assert_eq!(
+        seen.path,
+        format!("/v1/provider-subscriptions/{MIRROR_ID}/change-price")
+    );
+    assert!(seen.is_signed());
+    assert_eq!(
+        body_of(&seen),
+        serde_json::json!({"price_ref": "price_standard", "proration": "always_invoice"})
+    );
+    assert!(read.is_ok(), "{read:?}");
+}
+
+#[tokio::test]
+async fn the_portal_url_comes_back_and_never_shows_in_debug() {
+    let (base, server) = serve_once(
+        200,
+        answer(r#"{"url":"https://billing.stripe.com/p/session/test_secret"}"#.to_owned()),
+    )
+    .await;
+    let portal = client(&base)
+        .provider_portal(mirror_id(), "https://app-dev.turnosqr.com/#/plans")
+        .await;
+    let seen = seen(server).await;
+    assert_eq!(seen.method, "POST");
+    assert_eq!(
+        seen.path,
+        format!("/v1/provider-subscriptions/{MIRROR_ID}/portal")
+    );
+    assert!(seen.is_signed());
+    assert_eq!(
+        body_of(&seen),
+        serde_json::json!({"return_url": "https://app-dev.turnosqr.com/#/plans"})
+    );
+    let portal = match portal {
+        Ok(portal) => portal,
+        Err(error) => panic!("{error}"),
+    };
+    assert_eq!(
+        portal.url,
+        "https://billing.stripe.com/p/session/test_secret"
+    );
+    assert!(!format!("{portal:?}").contains("test_secret"));
+}
+
+#[tokio::test]
+async fn an_item_is_added_by_its_price() {
+    let (base, server) = serve_once(200, answer(r#"{"item_id":"si_1"}"#.to_owned())).await;
+    let added = client(&base).add_item(mirror_id(), "price_overage").await;
+    let seen = seen(server).await;
+    assert_eq!(seen.method, "POST");
+    assert_eq!(
+        seen.path,
+        format!("/v1/provider-subscriptions/{MIRROR_ID}/items")
+    );
+    assert!(seen.is_signed());
+    assert_eq!(
+        body_of(&seen),
+        serde_json::json!({"price_ref": "price_overage"})
+    );
+    match added {
+        Ok(added) => assert_eq!(added.item_id, "si_1"),
+        Err(error) => panic!("{error}"),
+    }
+}
+
+#[tokio::test]
+async fn usage_is_reported_in_one_batch_and_refusals_come_back_by_identifier() {
+    let (base, server) = serve_once(
+        200,
+        answer(
+            r#"{"accepted":1,"failed":[{"identifier":"turn-2","error":"meter not found"}]}"#
+                .to_owned(),
+        ),
+    )
+    .await;
+    let events = [
+        UsageEvent {
+            meter_event: "turnosqr_overage".into(),
+            value: 1,
+            identifier: "turn-1".into(),
+        },
+        UsageEvent {
+            meter_event: "turnosqr_overage".into(),
+            value: 1,
+            identifier: "turn-2".into(),
+        },
+    ];
+    let report = client(&base).report_usage(mirror_id(), &events).await;
+    let seen = seen(server).await;
+    assert_eq!(seen.method, "POST");
+    assert_eq!(
+        seen.path,
+        format!("/v1/provider-subscriptions/{MIRROR_ID}/usage")
+    );
+    assert!(seen.is_signed());
+    assert_eq!(
+        body_of(&seen)["events"][1]["identifier"],
+        serde_json::json!("turn-2")
+    );
+    match report {
+        Ok(report) => {
+            assert_eq!(report.accepted, 1);
+            assert_eq!(report.failed[0].identifier, "turn-2");
+        }
+        Err(error) => panic!("{error}"),
+    }
+}
+
+#[tokio::test]
+async fn the_price_catalog_is_read_with_a_signed_get() {
+    let (base, server) = serve_once(
+        200,
+        answer(r#"[{"price_ref":"price_basic","product_ref":"prod_1","unit_amount_minor":1299,"currency":"usd","interval":"month","interval_count":1,"usage_type":"licensed","active":true,"metadata":{"plan_slug":"plan_basic"}}]"#.to_owned()),
+    )
+    .await;
+    let prices = client(&base).provider_prices().await;
+    let seen = seen(server).await;
+    assert_eq!(seen.method, "GET");
+    assert_eq!(seen.path, "/v1/provider-catalog/prices");
+    assert!(seen.is_signed());
+    match prices {
+        Ok(prices) => {
+            assert_eq!(prices[0].price_ref, "price_basic");
+            assert_eq!(prices[0].metadata["plan_slug"], "plan_basic");
+        }
+        Err(error) => panic!("{error}"),
+    }
 }

@@ -9,7 +9,7 @@ Client of the Payments router for a product's Rust backend:
 The router decides nothing about your product. It only sends the customer to the provider's checkout (Stripe, ePayco) and tells you what happened. The full contract is the router's `llms.txt` (`https://<router>/llms.txt`).
 
 ```toml
-payments_sdk = { git = "https://github.com/JhonaCodes/payments_sdk", tag = "v0.1.0" }
+payments_sdk = { git = "https://github.com/JhonaCodes/payments_sdk", tag = "v0.2.0" }
 ```
 
 ## Integrate a product in five steps
@@ -86,8 +86,27 @@ payments_sdk = { git = "https://github.com/JhonaCodes/payments_sdk", tag = "v0.1
 | `subscription_charge` | `PaymentNotice` (with `subscription`) | a router subscription's charge; access until `current_period_end` |
 | `subscription_charge_upcoming` | `SubscriptionEventNotice` | tell the customer the amount and the date |
 | `subscription_cancelled` | `SubscriptionEventNotice` | no more charges; access until `current_period_end` |
+| `provider_subscription` | `ProviderSubscriptionNotice` | a subscription the provider manages changed (`reason`: `activated`, `renewed`, `payment_failed`, `cancel_scheduled`, `resumed`, `ended`, `updated`); apply its `subscription` snapshot unless its `version` is at or below the one you applied |
 
-Record a type you do not know and answer `2xx`; never refuse it.
+Record a type you do not know and answer `2xx`; never refuse it. `NoticeType` is `#[non_exhaustive]`: match it with a fallback arm.
+
+## Subscriptions the provider manages
+
+A charge with `provider_plan` opens a subscription the provider bills with the merchant's own plan (a Stripe Price). The router keeps its **mirror** (`ProviderSubscription`: the state as the provider reports it, with a growing `version`) and passes every operation on to the provider, so the product never holds the provider's keys nor its webhooks. Use the `ProviderSubscriptions` trait (implemented by `PaymentsClient`):
+
+| Method | Router route | What the provider does |
+| --- | --- | --- |
+| `provider_subscription(id)` | `GET /v1/provider-subscriptions/{id}` | — (the mirror) |
+| `provider_subscriptions_of(external_user_ref)` | `GET /v1/provider-subscriptions/by-user/{ref}` | — (live ones first) |
+| `cancel_provider_subscription(id, at_period_end)` | `POST …/{id}/cancel` | ends it now or at the period end |
+| `resume_provider_subscription(id)` | `POST …/{id}/resume` | undoes a scheduled end |
+| `change_provider_price(id, price_ref, proration)` | `POST …/{id}/change-price` | moves the base item to another price |
+| `provider_portal(id, return_url)` | `POST …/{id}/portal` | a page where the customer manages it (the URL signs them in: never store or log it) |
+| `add_item(id, price_ref)` | `POST …/{id}/items` | adds a metered item (idempotent by price) |
+| `report_usage(id, events)` | `POST …/{id}/usage` | bills metered usage; `identifier` makes a repeat count once |
+| `provider_prices()` | `GET /v1/provider-catalog/prices` | the merchant's prices at the provider |
+
+Every change comes back as a `provider_subscription` notice as well, so a product can act on the notice alone.
 
 ## Errors
 

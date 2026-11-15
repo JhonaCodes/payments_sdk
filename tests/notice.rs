@@ -3,10 +3,10 @@
 //! the router).
 
 use chrono::{TimeZone, Utc};
-use payments_sdk::model::{IntentStatus, SubscriptionStatus};
+use payments_sdk::model::{IntentStatus, ProviderSubscriptionStatus, SubscriptionStatus};
 use payments_sdk::notice::{
-    NoticeEnvelope, NoticeRejection, NoticeType, PaymentNotice, SignedHeaders,
-    SubscriptionEventNotice, verify_notice,
+    NoticeEnvelope, NoticeRejection, NoticeType, PaymentNotice, ProviderSubscriptionNotice,
+    ProviderSubscriptionReason, SignedHeaders, SubscriptionEventNotice, verify_notice,
 };
 
 const SECRET: &str = "test-notice-secret-0123456789";
@@ -260,4 +260,100 @@ fn a_cancellation_notice_names_the_subscription() {
     assert_eq!(notice.notice_type, NoticeType::SubscriptionCancelled);
     assert_eq!(notice.cancelled_by.as_deref(), Some("customer"));
     assert_eq!(notice.subscription.status, SubscriptionStatus::Cancelled);
+}
+
+const MIRROR: &str = r#"{
+    "id": "9d1e0000-0000-4000-8000-000000000010",
+    "provider": "stripe",
+    "provider_subscription_id": "sub_1",
+    "provider_customer_id": "cus_1",
+    "external_user_ref": "5b6c0000-0000-4000-8000-000000000003",
+    "external_order_id": "5b6c:plan_basic:1700000000",
+    "external_product_ref": "plan_basic",
+    "origin_intent_id": "3f2a0000-0000-4000-8000-000000000002",
+    "price_ref": "price_basic",
+    "metered_item_id": null,
+    "status": "past_due",
+    "current_period_start": "2026-11-01T00:00:00Z",
+    "current_period_end": "2026-12-01T00:00:00Z",
+    "cancel_at_period_end": false,
+    "canceled_at": null,
+    "ended_at": null,
+    "trial_end": null,
+    "version": 7,
+    "created_at": "2026-11-01T00:00:00Z",
+    "updated_at": "2026-11-15T00:00:00Z"
+}"#;
+
+#[test]
+fn a_provider_subscription_notice_is_known_and_carries_the_snapshot() {
+    assert_eq!(
+        NoticeType::parse("provider_subscription"),
+        Some(NoticeType::ProviderSubscription)
+    );
+    let json = format!(
+        r#"{{"event_id":"7c1e0000-0000-4000-8000-000000000011","type":"provider_subscription","reason":"payment_failed","external_user_ref":"5b6c0000-0000-4000-8000-000000000003","subscription":{MIRROR},"invoice":{{"provider_invoice_id":"in_1","amount_paid":{{"minor":0,"currency":"USD"}},"period_start":"2026-11-01T00:00:00Z","period_end":"2026-12-01T00:00:00Z"}}}}"#
+    );
+    let notice: ProviderSubscriptionNotice = match serde_json::from_str(&json) {
+        Ok(notice) => notice,
+        Err(error) => panic!("{error}"),
+    };
+    assert_eq!(notice.notice_type, NoticeType::ProviderSubscription);
+    assert_eq!(notice.reason, ProviderSubscriptionReason::PaymentFailed);
+    assert_eq!(
+        notice.subscription.status,
+        ProviderSubscriptionStatus::PastDue
+    );
+    assert!(!notice.subscription.status.is_active());
+    assert_eq!(notice.subscription.version, 7);
+    assert_eq!(
+        notice.subscription.price_ref.as_deref(),
+        Some("price_basic")
+    );
+    assert_eq!(
+        notice.invoice.map(|invoice| invoice.provider_invoice_id),
+        Some("in_1".to_owned())
+    );
+}
+
+#[test]
+fn a_reason_or_a_status_this_version_does_not_know_still_reads() {
+    let json = format!(
+        r#"{{"event_id":"7c1e0000-0000-4000-8000-000000000012","type":"provider_subscription","reason":"something_new","external_user_ref":"u","subscription":{}}}"#,
+        MIRROR.replace("\"past_due\"", "\"a_new_state\"")
+    );
+    let notice: ProviderSubscriptionNotice = match serde_json::from_str(&json) {
+        Ok(notice) => notice,
+        Err(error) => panic!("{error}"),
+    };
+    assert_eq!(notice.reason, ProviderSubscriptionReason::Unknown);
+    assert_eq!(
+        notice.subscription.status,
+        ProviderSubscriptionStatus::Unknown
+    );
+    assert!(notice.invoice.is_none());
+}
+
+#[test]
+fn a_provider_plan_payment_notice_names_the_routers_mirror() {
+    let json = r#"{
+        "event_id": "7c1e0000-0000-4000-8000-000000000013",
+        "type": "payment",
+        "intent_id": "3f2a0000-0000-4000-8000-000000000002",
+        "external_order_id": "o",
+        "external_product_ref": "plan_basic",
+        "external_user_ref": "u",
+        "status": "paid",
+        "amount": {"minor": 1299, "currency": "USD"},
+        "provider_transaction_id": "sub_1",
+        "provider_subscription_id": "9d1e0000-0000-4000-8000-000000000010"
+    }"#;
+    let notice: PaymentNotice = match serde_json::from_str(json) {
+        Ok(notice) => notice,
+        Err(error) => panic!("{error}"),
+    };
+    assert_eq!(
+        notice.provider_subscription_id.map(|id| id.to_string()),
+        Some("9d1e0000-0000-4000-8000-000000000010".to_owned())
+    );
 }
