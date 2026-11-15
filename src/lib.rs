@@ -17,9 +17,10 @@ pub mod signature;
 pub use client::{PaymentsClient, PaymentsConfig, PaymentsGateway, ProviderSubscriptions};
 pub use error::PaymentsError;
 pub use model::{
-    AddedItem, CreateIntent, CreateSubscription, Intent, IntentStatus, Money, Plan, PortalSession,
-    Proration, ProviderPrice, ProviderSubscription, ProviderSubscriptionStatus, Subscription,
-    SubscriptionStatus, UsageEvent, UsageFailure, UsageReport,
+    AddedItem, AdoptProviderSubscription, CreateIntent, CreateSubscription, Intent, IntentStatus,
+    Money, Plan, PortalSession, Proration, ProviderPrice, ProviderSubscription,
+    ProviderSubscriptionStatus, Subscription, SubscriptionStatus, UsageEvent, UsageFailure,
+    UsageReport,
 };
 pub use notice::{
     NoticeEnvelope, NoticeRejection, NoticeType, PaymentNotice, ProviderInvoice,

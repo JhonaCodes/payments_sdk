@@ -230,6 +230,22 @@ pub struct ProviderSubscription {
     pub updated_at: Option<DateTime<Utc>>,
 }
 
+/// `POST /v1/provider-subscriptions/adopt`: registers the mirror of a
+/// subscription that already exists on the merchant's own provider account
+/// (one opened before the router). The router writes nothing to the
+/// provider. Adopting it again with the same `external_user_ref` answers the
+/// same mirror; with another one, a `409`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdoptProviderSubscription {
+    /// The provider (`"stripe"`).
+    pub provider: String,
+    /// The provider's id (`sub_…`).
+    pub provider_subscription_id: String,
+    pub external_user_ref: String,
+    pub external_order_id: String,
+    pub external_product_ref: String,
+}
+
 /// How a price change is billed at the provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

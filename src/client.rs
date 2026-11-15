@@ -15,8 +15,9 @@ use uuid::Uuid;
 
 use crate::error::PaymentsError;
 use crate::model::{
-    AddedItem, CreateIntent, CreateSubscription, Intent, Plan, PortalSession, Proration,
-    ProviderPrice, ProviderSubscription, Subscription, UsageEvent, UsageReport,
+    AddedItem, AdoptProviderSubscription, CreateIntent, CreateSubscription, Intent, Plan,
+    PortalSession, Proration, ProviderPrice, ProviderSubscription, Subscription, UsageEvent,
+    UsageReport,
 };
 use crate::notice::{MERCHANT_HEADER, NONCE_HEADER, SIGNATURE_HEADER, TIMESTAMP_HEADER};
 use crate::signature::{build_message, sign};
@@ -267,6 +268,13 @@ pub trait ProviderSubscriptions: Send + Sync {
     ) -> Result<UsageReport, PaymentsError>;
     /// The merchant's prices at the provider.
     async fn provider_prices(&self) -> Result<Vec<ProviderPrice>, PaymentsError>;
+    /// Registers the mirror of a subscription opened on the merchant's own
+    /// provider account before the router; answers it (`origin_intent_id`
+    /// null). Idempotent for the same `external_user_ref`.
+    async fn adopt_provider_subscription(
+        &self,
+        request: &AdoptProviderSubscription,
+    ) -> Result<ProviderSubscription, PaymentsError>;
 }
 
 /// `value` as one path segment: every byte but the unreserved ones
@@ -419,5 +427,17 @@ impl ProviderSubscriptions for PaymentsClient {
     async fn provider_prices(&self) -> Result<Vec<ProviderPrice>, PaymentsError> {
         self.call::<(), _>(Method::GET, "/v1/provider-catalog/prices", None)
             .await
+    }
+
+    async fn adopt_provider_subscription(
+        &self,
+        request: &AdoptProviderSubscription,
+    ) -> Result<ProviderSubscription, PaymentsError> {
+        self.call(
+            Method::POST,
+            "/v1/provider-subscriptions/adopt",
+            Some(request),
+        )
+        .await
     }
 }

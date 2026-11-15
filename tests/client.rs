@@ -11,7 +11,8 @@ use payments_sdk::client::{
     PaymentsClient, PaymentsConfig, PaymentsGateway, ProviderSubscriptions,
 };
 use payments_sdk::model::{
-    CreateIntent, IntentStatus, Proration, ProviderSubscriptionStatus, UsageEvent,
+    AdoptProviderSubscription, CreateIntent, IntentStatus, Proration, ProviderSubscriptionStatus,
+    UsageEvent,
 };
 use payments_sdk::signature::{build_message, verify, within_window};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -495,5 +496,63 @@ async fn the_price_catalog_is_read_with_a_signed_get() {
             assert_eq!(prices[0].metadata["plan_slug"], "plan_basic");
         }
         Err(error) => panic!("{error}"),
+    }
+}
+
+fn adoption() -> AdoptProviderSubscription {
+    AdoptProviderSubscription {
+        provider: "stripe".into(),
+        provider_subscription_id: "sub_1".into(),
+        external_user_ref: "company-1".into(),
+        external_order_id: "sub_1".into(),
+        external_product_ref: "plan_basic".into(),
+    }
+}
+
+#[tokio::test]
+async fn an_adoption_posts_the_subscription_signed_and_parses_a_mirror_without_origin() {
+    let (base, server) = serve_once(200, answer(mirror("active"))).await;
+    let adopted = client(&base).adopt_provider_subscription(&adoption()).await;
+    let seen = seen(server).await;
+    assert_eq!(seen.method, "POST");
+    assert_eq!(seen.path, "/v1/provider-subscriptions/adopt");
+    assert!(seen.is_signed(), "the router would refuse this signature");
+    assert_eq!(
+        body_of(&seen),
+        serde_json::json!({
+            "provider": "stripe",
+            "provider_subscription_id": "sub_1",
+            "external_user_ref": "company-1",
+            "external_order_id": "sub_1",
+            "external_product_ref": "plan_basic",
+        })
+    );
+    match adopted {
+        Ok(adopted) => {
+            assert_eq!(adopted.id, mirror_id());
+            assert_eq!(adopted.origin_intent_id, None);
+            assert_eq!(adopted.status, ProviderSubscriptionStatus::Active);
+        }
+        Err(error) => panic!("{error}"),
+    }
+}
+
+#[tokio::test]
+async fn an_adoption_of_another_customers_subscription_is_a_409_rejection() {
+    let (base, server) = serve_once(
+        409,
+        r#"{"status":"error","code":409,"error_code":"CONFLICT","details":"sub_1 is already mirrored for another external_user_ref"}"#,
+    )
+    .await;
+    let adopted = client(&base).adopt_provider_subscription(&adoption()).await;
+    let _ = server.await;
+    match adopted {
+        Err(PaymentsError::Rejected {
+            status, error_code, ..
+        }) => {
+            assert_eq!(status, 409);
+            assert_eq!(error_code.as_deref(), Some("CONFLICT"));
+        }
+        other => panic!("expected a 409 rejection, got {other:?}"),
     }
 }
