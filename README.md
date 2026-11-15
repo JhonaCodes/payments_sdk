@@ -9,7 +9,7 @@ Client of the Payments router for a product's Rust backend:
 The router decides nothing about your product. It only sends the customer to the provider's checkout (Stripe, ePayco) and tells you what happened. The full contract is the router's `llms.txt` (`https://<router>/llms.txt`).
 
 ```toml
-payments_sdk = { git = "https://github.com/JhonaCodes/payments_sdk", tag = "v0.2.0" }
+payments_sdk = { git = "https://github.com/JhonaCodes/payments_sdk", tag = "v0.3.0" }
 ```
 
 ## Integrate a product in five steps
@@ -105,8 +105,33 @@ A charge with `provider_plan` opens a subscription the provider bills with the m
 | `add_item(id, price_ref)` | `POST …/{id}/items` | adds a metered item (idempotent by price) |
 | `report_usage(id, events)` | `POST …/{id}/usage` | bills metered usage; `identifier` makes a repeat count once |
 | `provider_prices()` | `GET /v1/provider-catalog/prices` | the merchant's prices at the provider |
+| `adopt_provider_subscription(request)` | `POST /v1/provider-subscriptions/adopt` | — (mirrors a subscription opened before the router; below) |
 
 Every change comes back as a `provider_subscription` notice as well, so a product can act on the notice alone.
+
+### Adopt a subscription opened before the router
+
+A subscription the product opened at the provider directly (before it moved to the router) has no mirror, so none of the operations above can reach it. `adopt_provider_subscription` registers its mirror (`POST /v1/provider-subscriptions/adopt`); the router reads it from the merchant's own provider account and writes nothing to the provider:
+
+```rust
+use payments_sdk::{AdoptProviderSubscription, ProviderSubscriptions};
+
+let mirror = client.adopt_provider_subscription(&AdoptProviderSubscription {
+    provider: "stripe".into(),
+    provider_subscription_id: stored_sub_id.clone(),   // the `sub_…` you kept
+    external_user_ref: company.to_string(),
+    external_order_id: stored_sub_id.clone(),
+    external_product_ref: plan.into(),
+}).await?;
+// Apply `mirror` as you apply a notice's snapshot: live → active plan,
+// ended (`status.has_ended()`) → back to your free plan.
+```
+
+- The answer is the mirror (`origin_intent_id: null`); **no notice** is sent for the adoption itself. Later changes (renewals, failed charges, the end) arrive as `provider_subscription` notices.
+- Adopting again with the same `external_user_ref` answers the same mirror (idempotent); with another one, `409`.
+- `404` when the subscription is not on the merchant's provider account, or its metadata names another merchant.
+- An ended subscription is adopted too, so the product can take the plan down.
+- Only adopt the `sub_…` you stored for that same customer: the router cannot verify `external_user_ref`.
 
 ## Errors
 
