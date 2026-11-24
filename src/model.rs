@@ -88,6 +88,10 @@ pub struct CreateSubscription {
     pub external_user_ref: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub return_url: Option<String>,
+    /// The units charged from the first period, on a plan with unit pricing
+    /// only (the router refuses it on any other plan). Absent: 0.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub units: Option<u32>,
 }
 
 /// The states of a router subscription.
@@ -115,7 +119,21 @@ pub struct Subscription {
     pub external_plan_ref: String,
     #[serde(default)]
     pub plan_name: Option<String>,
+    /// What the next period charges: `base_amount` plus `unit_amount` for
+    /// every unit above `included_units`.
     pub amount: Money,
+    /// The base amount the customer accepted (routers before 0.10 do not
+    /// send it).
+    #[serde(default)]
+    pub base_amount: Option<Money>,
+    /// Price per unit above `included_units`; `None` without unit pricing.
+    #[serde(default)]
+    pub unit_amount: Option<Money>,
+    #[serde(default)]
+    pub included_units: u32,
+    /// The units the merchant reported; they apply from the next charge.
+    #[serde(default)]
+    pub units: u32,
     pub interval_unit: String,
     pub interval_count: i32,
     #[serde(default)]
@@ -149,6 +167,52 @@ pub struct Plan {
     #[serde(default)]
     pub trial_days: i32,
     pub active: bool,
+    /// Price per unit above `included_units`; `None` without unit pricing.
+    #[serde(default)]
+    pub unit_amount: Option<Money>,
+    /// Units `amount` already covers.
+    #[serde(default)]
+    pub included_units: u32,
+}
+
+impl Plan {
+    /// What one period of this plan charges with `units`, the same way the
+    /// router computes it ([`period_amount`]).
+    pub fn period_amount(&self, units: u32) -> Option<Money> {
+        period_amount(
+            &self.amount,
+            self.unit_amount.as_ref(),
+            self.included_units,
+            units,
+        )
+    }
+}
+
+/// What one period charges, exactly as the router computes it: `base +
+/// unit_amount × max(0, units − included_units)` in minor units, or `base`
+/// without a unit price. `None` when the unit price is in another currency
+/// or the result does not fit in an `i64`.
+pub fn period_amount(
+    base: &Money,
+    unit_amount: Option<&Money>,
+    included_units: u32,
+    units: u32,
+) -> Option<Money> {
+    let Some(unit) = unit_amount else {
+        return Some(base.clone());
+    };
+    if unit.currency != base.currency {
+        return None;
+    }
+    let billable = i64::from(units.saturating_sub(included_units));
+    let minor = unit
+        .minor
+        .checked_mul(billable)
+        .and_then(|extra| base.minor.checked_add(extra))?;
+    Some(Money {
+        minor,
+        currency: base.currency.clone(),
+    })
 }
 
 /// The states of a subscription the provider manages itself (a Stripe

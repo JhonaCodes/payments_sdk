@@ -75,6 +75,15 @@ pub trait PaymentsGateway: Send + Sync {
         &self,
         subscription_id: Uuid,
     ) -> Result<Subscription, PaymentsError>;
+    /// Sets the units of a router subscription whose plan has unit pricing
+    /// (`POST /v1/subscriptions/{id}/units`). They apply from the next
+    /// charge, never mid-period; the same units again change nothing, so a
+    /// retry is safe.
+    async fn update_subscription_units(
+        &self,
+        subscription_id: Uuid,
+        units: u32,
+    ) -> Result<Subscription, PaymentsError>;
     /// The merchant's active plans (`GET /v1/plans`).
     async fn list_plans(&self) -> Result<Vec<Plan>, PaymentsError>;
 }
@@ -214,9 +223,27 @@ impl PaymentsGateway for PaymentsClient {
         .await
     }
 
+    async fn update_subscription_units(
+        &self,
+        subscription_id: Uuid,
+        units: u32,
+    ) -> Result<Subscription, PaymentsError> {
+        self.call(
+            Method::POST,
+            &format!("/v1/subscriptions/{subscription_id}/units"),
+            Some(&UnitsBody { units }),
+        )
+        .await
+    }
+
     async fn list_plans(&self) -> Result<Vec<Plan>, PaymentsError> {
         self.call::<(), _>(Method::GET, "/v1/plans", None).await
     }
+}
+
+#[derive(Serialize)]
+struct UnitsBody {
+    units: u32,
 }
 
 /// What a merchant asks the router about the subscriptions a provider
