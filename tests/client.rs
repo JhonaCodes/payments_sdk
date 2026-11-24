@@ -11,7 +11,7 @@ use payments_sdk::client::{
     PaymentsClient, PaymentsConfig, PaymentsGateway, ProviderSubscriptions,
 };
 use payments_sdk::model::{
-    AdoptProviderSubscription, CreateIntent, IntentStatus, Proration, ProviderSubscriptionStatus,
+    AdoptProviderSubscription, CreateIntent, CreateSubscription, IntentStatus, Proration, ProviderSubscriptionStatus,
     UsageEvent,
 };
 use payments_sdk::signature::{build_message, verify, within_window};
@@ -555,4 +555,61 @@ async fn an_adoption_of_another_customers_subscription_is_a_409_rejection() {
         }
         other => panic!("expected a 409 rejection, got {other:?}"),
     }
+}
+
+/// A router subscription on a unit-priced plan, as the router answers it.
+fn unit_subscription(units: u32, amount_minor: i64) -> String {
+    format!(
+        r#"{{"subscription_id":"{MIRROR_ID}","status":"active","cancel_reason":null,"external_user_ref":"company-1","external_plan_ref":"corporativo","plan_name":"Corporativo","amount":{{"minor":{amount_minor},"currency":"COP"}},"base_amount":{{"minor":69000000,"currency":"COP"}},"unit_amount":{{"minor":69000,"currency":"COP"}},"included_units":1000,"units":{units},"interval_unit":"month","interval_count":1,"current_period_start":null,"current_period_end":null,"next_charge_at":null,"failed_charges":0,"has_payment_method":true,"subscribe_url":null,"manage_url":null,"cancelled_at":null}}"#
+    )
+}
+
+#[tokio::test]
+async fn the_units_of_a_subscription_are_posted_signed_and_the_new_amount_comes_back() {
+    let (base, server) = serve_once(200, answer(unit_subscription(1_500, 103_500_000))).await;
+    let read = client(&base)
+        .update_subscription_units(mirror_id(), 1_500)
+        .await;
+    let seen = seen(server).await;
+    assert_eq!(seen.method, "POST");
+    assert_eq!(seen.path, format!("/v1/subscriptions/{MIRROR_ID}/units"));
+    assert!(seen.is_signed(), "the router would refuse this signature");
+    assert_eq!(body_of(&seen), serde_json::json!({"units": 1500}));
+    match read {
+        Ok(read) => {
+            assert_eq!(read.units, 1_500);
+            assert_eq!(read.included_units, 1_000);
+            assert_eq!(read.amount.minor, 103_500_000);
+            assert_eq!(read.unit_amount.map(|unit| unit.minor), Some(69_000));
+        }
+        Err(error) => panic!("{error}"),
+    }
+}
+
+#[tokio::test]
+async fn a_subscription_is_opened_with_its_units_only_when_given() {
+    let (base, server) = serve_once(201, answer(unit_subscription(1_200, 82_800_000))).await;
+    let opened = client(&base)
+        .create_subscription(&CreateSubscription {
+            external_plan_ref: "corporativo".into(),
+            external_user_ref: "company-1".into(),
+            units: Some(1_200),
+            ..CreateSubscription::default()
+        })
+        .await;
+    let seen = seen(server).await;
+    assert_eq!(seen.path, "/v1/subscriptions");
+    assert!(seen.is_signed());
+    assert_eq!(body_of(&seen)["units"], 1_200);
+    assert!(opened.is_ok(), "{opened:?}");
+
+    let without = match serde_json::to_value(CreateSubscription {
+        external_plan_ref: "micro".into(),
+        external_user_ref: "company-2".into(),
+        ..CreateSubscription::default()
+    }) {
+        Ok(value) => value,
+        Err(error) => panic!("{error}"),
+    };
+    assert!(without.get("units").is_none(), "absent units are not sent");
 }

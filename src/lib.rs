@@ -20,7 +20,7 @@ pub use model::{
     AddedItem, AdoptProviderSubscription, CreateIntent, CreateSubscription, Intent, IntentStatus,
     Money, Plan, PortalSession, Proration, ProviderPrice, ProviderSubscription,
     ProviderSubscriptionStatus, Subscription, SubscriptionStatus, UsageEvent, UsageFailure,
-    UsageReport,
+    UsageReport, period_amount,
 };
 pub use notice::{
     NoticeEnvelope, NoticeRejection, NoticeType, PaymentNotice, ProviderInvoice,

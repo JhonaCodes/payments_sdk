@@ -9,7 +9,7 @@ Client of the Payments router for a product's Rust backend:
 The router decides nothing about your product. It only sends the customer to the provider's checkout (Stripe, ePayco) and tells you what happened. The full contract is the router's `llms.txt` (`https://<router>/llms.txt`).
 
 ```toml
-payments_sdk = { git = "https://github.com/JhonaCodes/payments_sdk", tag = "v0.3.0" }
+payments_sdk = { git = "https://github.com/JhonaCodes/payments_sdk", tag = "v0.4.0" }
 ```
 
 ## Integrate a product in five steps
@@ -77,6 +77,31 @@ payments_sdk = { git = "https://github.com/JhonaCodes/payments_sdk", tag = "v0.3
    | any other `4xx` | your refusal; never retried |
 
    Answer `503` while your configuration or database is not ready, and a `4xx` only for a notice you will never accept.
+
+## Unit pricing (router subscriptions)
+
+A router plan may carry `unit_amount` and `included_units` (router 0.10+). Every period then charges `amount + unit_amount × max(0, units − included_units)`, in minor units. The subscription carries the `units` you report:
+
+```rust
+use payments_sdk::{CreateSubscription, PaymentsGateway};
+
+// Open it with the units it counts from the first charge…
+let subscription = client.create_subscription(&CreateSubscription {
+    external_plan_ref: "corporativo".into(),
+    external_user_ref: company.to_string(),
+    units: Some(active_workers),
+    ..CreateSubscription::default()
+}).await?;
+
+// …and report every change. It applies from the next charge (never
+// mid-period); the same units again change nothing, so retrying is safe.
+let updated = client.update_subscription_units(subscription.subscription_id, active_workers).await?;
+// `updated.amount` is what the next period charges.
+```
+
+- `units` is refused (`422`) on a plan without `unit_amount`, and on a cancelled subscription (`409`).
+- `Plan::period_amount(units)` and `period_amount(...)` compute the charge exactly as the router does, to show the next charge before asking the router.
+- `Subscription` adds `base_amount`, `unit_amount`, `included_units` and `units`; `amount` is the next period's charge. A `subscription_charge` notice's top-level `amount` is what that charge took.
 
 ## Notice types
 
